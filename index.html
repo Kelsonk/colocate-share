@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Colocate Screen Share</title>
+<style>
+  :root {
+    --bg: #0f131b; --panel: #171d29; --border: #2a3345; --text: #e8eaf0; --dim: #9aa3b8;
+    --accent: #5bc8f5; --danger: #f07a7a; --ok: #7ad99a;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f4f6fa; --panel: #ffffff; --border: #d8deea; --text: #151a24; --dim: #5b667d;
+      --accent: #0a84c6; --danger: #c43d3d; --ok: #1f8a4c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+  }
+  main {
+    width: 100%; max-width: 460px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 16px; padding: 28px;
+  }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  p { margin: 0 0 20px; color: var(--dim); }
+  label { display: block; font-size: 14px; color: var(--dim); margin-bottom: 6px; }
+  input {
+    width: 100%; font: 600 28px/1 ui-monospace, "Cascadia Mono", Consolas, monospace; letter-spacing: 0.3em;
+    text-transform: uppercase; text-align: center; padding: 14px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button {
+    width: 100%; margin-top: 16px; padding: 14px; font: 600 16px system-ui, sans-serif; border: 0;
+    border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.stop { background: var(--danger); }
+  #status { margin-top: 16px; min-height: 1.5em; color: var(--dim); }
+  #status.error { color: var(--danger); }
+  #status.ok { color: var(--ok); }
+  ul { list-style: none; padding: 0; margin: 12px 0 0; }
+  li { padding: 6px 0; border-top: 1px solid var(--border); font-size: 14px; display: flex; justify-content: space-between; }
+  .hint { font-size: 13px; margin-top: 20px; margin-bottom: 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Share your screen</h1>
+  <p>Show this computer's screen on the Colocate TV in your headset.</p>
+
+  <form id="form">
+    <label for="code">Code shown in the headset</label>
+    <input id="code" maxlength="6" autocomplete="off" spellcheck="false" placeholder="ABC123" required>
+    <button id="go" type="submit">Share my screen</button>
+  </form>
+  <button id="stop" class="stop" hidden>Stop sharing</button>
+
+  <div id="status" role="status"></div>
+  <ul id="peers"></ul>
+
+  <p class="hint">Your computer and headset must be on the same Wi-Fi. The picture goes directly
+  between them over your network. To include sound, tick "Share system audio" (or "Share tab
+  audio") in the browser's share window. Streaming services like Netflix or Disney+ show up
+  black. They block screen sharing.</p>
+</main>
+
+<script>
+// Relay that swaps connection details between this page and the headset (web/relay). Must match
+// ScreenShareConfig.RelayUrl in the app.
+const RELAY = "";
+
+const $ = (id) => document.getElementById(id);
+const status = (text, kind = "") => { $("status").textContent = text; $("status").className = kind; };
+
+let stream = null;
+let peerPoll = null;
+const conns = new Map(); // peerId -> {pc, name, state}
+
+if (!window.isSecureContext || !navigator.mediaDevices?.getDisplayMedia) {
+  status("This browser can't share its screen. Use Chrome or Edge on a computer.", "error");
+  $("go").disabled = true;
+}
+if (!RELAY) { status("Screen sharing isn't set up yet.", "error"); $("go").disabled = true; }
+
+$("code").addEventListener("input", (e) => {
+  e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+});
+
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const code = $("code").value;
+  if (code.length !== 6) return status("The code is 6 characters.", "error");
+  $("go").disabled = true;
+  try {
+    const peers = await getPeers(code);
+    if (peers.length === 0) {
+      $("go").disabled = false;
+      return status("No headset is waiting with that code. Check the code in the headset and try again.", "error");
+    }
+    status("Pick what to share…");
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 30, max: 60 }, width: { max: 1920 }, height: { max: 1080 } },
+      audio: true,
+      systemAudio: "include",
+    });
+  } catch (err) {
+    $("go").disabled = false;
+    return status(err.name === "NotAllowedError" ? "Sharing was cancelled." : `Couldn't start: ${err.message}`, "error");
+  }
+  const video = stream.getVideoTracks()[0];
+  video.contentHint = "motion";
+  video.addEventListener("ended", stopSharing); // the browser's own "Stop sharing" bar
+
+  $("form").hidden = true;
+  $("stop").hidden = false;
+  status("Connecting…");
+  // Keep checking for headsets, so ones that open their "From PC" screen later join in too.
+  const tick = async () => {
+    try {
+      for (const p of await getPeers(code)) if (!conns.has(p.id)) connect(code, p);
+    } catch { /* transient relay error; next tick retries */ }
+  };
+  await tick();
+  peerPoll = setInterval(tick, 3000);
+});
+
+$("stop").addEventListener("click", stopSharing);
+
+function stopSharing() {
+  clearInterval(peerPoll);
+  for (const c of conns.values()) c.pc.close();
+  conns.clear();
+  stream?.getTracks().forEach((t) => t.stop());
+  stream = null;
+  $("form").hidden = false;
+  $("stop").hidden = true;
+  $("go").disabled = false;
+  $("peers").innerHTML = "";
+  status("Stopped sharing.");
+}
+
+async function connect(code, peer) {
+  const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+  const conn = { pc, name: peer.name, state: "connecting" };
+  conns.set(peer.id, conn);
+  render();
+
+  for (const track of stream.getTracks()) {
+    const sender = pc.addTrack(track, stream);
+    if (track.kind === "video") {
+      // The headset decodes H.264 in hardware; prefer it when this browser offers it.
+      const caps = RTCRtpSender.getCapabilities?.("video");
+      const t = pc.getTransceivers().find((x) => x.sender === sender);
+      if (caps && t?.setCodecPreferences) {
+        const h264 = caps.codecs.filter((c) => c.mimeType === "video/H264");
+        if (h264.length) t.setCodecPreferences([...h264, ...caps.codecs.filter((c) => c.mimeType !== "video/H264")]);
+      }
+    }
+  }
+  pc.onconnectionstatechange = () => {
+    conn.state = pc.connectionState;
+    if (pc.connectionState === "connected") tuneVideo(pc);
+    if (pc.connectionState === "failed" || pc.connectionState === "closed") conns.delete(peer.id);
+    render();
+  };
+
+  try {
+    await pc.setLocalDescription(await pc.createOffer());
+    await gatheringComplete(pc);
+    await relay("POST", `/s/${code}/offer/${peer.id}`, { sdp: pc.localDescription.sdp });
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline && conns.get(peer.id) === conn) {
+      const res = await relay("GET", `/s/${code}/answer/${peer.id}`);
+      if (res?.sdp) { await pc.setRemoteDescription({ type: "answer", sdp: res.sdp }); return; }
+      await sleep(1000);
+    }
+    throw new Error("the headset didn't answer");
+  } catch (err) {
+    console.warn(err);
+    conn.state = "failed";
+    pc.close();
+    conns.delete(peer.id);
+    render();
+  }
+}
+
+// Plenty for 1080p over home Wi-Fi without starving it.
+async function tuneVideo(pc) {
+  const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+  if (!sender) return;
+  const params = sender.getParameters();
+  if (!params.encodings?.length) params.encodings = [{}];
+  params.encodings[0].maxBitrate = 8_000_000;
+  params.encodings[0].maxFramerate = 30;
+  try { await sender.setParameters(params); } catch (err) { console.warn(err); }
+}
+
+function render() {
+  const labels = { new: "Connecting…", connecting: "Connecting…", connected: "Sharing", disconnected: "Reconnecting…", failed: "Couldn't connect", closed: "Stopped" };
+  $("peers").innerHTML = "";
+  for (const c of conns.values()) {
+    const li = document.createElement("li");
+    li.append(Object.assign(document.createElement("span"), { textContent: c.name }));
+    li.append(Object.assign(document.createElement("span"), { textContent: labels[c.state] || c.state }));
+    $("peers").append(li);
+  }
+  const live = [...conns.values()].some((c) => c.state === "connected");
+  if (stream) status(live ? "Sharing to your headset." : "Connecting…", live ? "ok" : "");
+}
+
+function gatheringComplete(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => { if (pc.iceGatheringState === "complete") resolve(); };
+    pc.addEventListener("icegatheringstatechange", done);
+    setTimeout(resolve, 3000); // enough for LAN candidates; don't hang on a slow STUN reply
+  });
+}
+
+async function getPeers(code) {
+  return (await relay("GET", `/s/${code}/peers`))?.peers ?? [];
+}
+
+async function relay(method, path, body) {
+  const res = await fetch(RELAY + path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 204) return null;
+  if (!res.ok) throw new Error(`relay ${res.status}`);
+  return res.json();
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+</script>
+</body>
+</html>
