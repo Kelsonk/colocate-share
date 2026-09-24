@@ -72,7 +72,7 @@
 <script>
 // Relay that swaps connection details between this page and the headset (web/relay). Must match
 // ScreenShareConfig.RelayUrl in the app.
-const RELAY = "";
+const RELAY = "https://colocate-relay.colocate.workers.dev";
 
 const $ = (id) => document.getElementById(id);
 const status = (text, kind = "") => { $("status").textContent = text; $("status").className = kind; };
