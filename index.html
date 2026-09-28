@@ -113,7 +113,9 @@ $("form").addEventListener("submit", async (e) => {
     return status(err.name === "NotAllowedError" ? "Sharing was cancelled." : `Couldn't start: ${err.message}`, "error");
   }
   const video = stream.getVideoTracks()[0];
-  video.contentHint = "motion";
+  // "detail", not "motion": a desktop is text and UI, so under bandwidth/CPU pressure keep the
+  // resolution and drop frames instead of going soft (it was reported blurry, 2026-09-28).
+  video.contentHint = "detail";
   video.addEventListener("ended", stopSharing); // the browser's own "Stop sharing" bar
 
   $("form").hidden = true;
@@ -176,7 +178,7 @@ async function connect(code, peer) {
     const deadline = Date.now() + 30000;
     while (Date.now() < deadline && conns.get(peer.id) === conn) {
       const res = await relay("GET", `/s/${code}/answer/${peer.id}`);
-      if (res?.sdp) { await pc.setRemoteDescription({ type: "answer", sdp: res.sdp }); return; }
+      if (res?.sdp) { await pc.setRemoteDescription({ type: "answer", sdp: fastStart(res.sdp) }); return; }
       await sleep(1000);
     }
     throw new Error("the headset didn't answer");
@@ -189,14 +191,26 @@ async function connect(code, peer) {
   }
 }
 
-// Plenty for 1080p over home Wi-Fi without starving it.
+// WebRTC starts every connection at a low bitrate and only ramps up as it measures the link, so a
+// share began blurry and sharpened over several seconds (reported 2026-09-28). This is always a
+// same-LAN link, so tell Chrome's encoder to start high and never go below a sane floor. The
+// x-google-* fmtp parameters are Chrome-specific; other browsers ignore them.
+function fastStart(sdp) {
+  return sdp.replace(/^(a=fmtp:\d+ .*)$/gm, (line) =>
+    line.includes("x-google-start-bitrate") ? line
+      : `${line};x-google-start-bitrate=6000;x-google-min-bitrate=2500;x-google-max-bitrate=12000`);
+}
+
+// Sharp 1080p over home Wi-Fi: full resolution kept, frame rate gives way first if it must.
 async function tuneVideo(pc) {
   const sender = pc.getSenders().find((s) => s.track?.kind === "video");
   if (!sender) return;
   const params = sender.getParameters();
   if (!params.encodings?.length) params.encodings = [{}];
-  params.encodings[0].maxBitrate = 8_000_000;
+  params.encodings[0].maxBitrate = 12_000_000; // same-LAN link; text needs the headroom
   params.encodings[0].maxFramerate = 30;
+  params.encodings[0].scaleResolutionDownBy = 1; // never pre-shrink the capture
+  params.degradationPreference = "maintain-resolution";
   try { await sender.setParameters(params); } catch (err) { console.warn(err); }
 }
 
