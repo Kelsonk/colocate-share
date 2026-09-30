@@ -132,10 +132,19 @@ $("form").addEventListener("submit", async (e) => {
 });
 
 $("stop").addEventListener("click", stopSharing);
+// Closing the tab stops sharing too — say so, rather than leave headsets waiting on a dead link.
+window.addEventListener("pagehide", stopSharing);
 
 function stopSharing() {
   clearInterval(peerPoll);
-  for (const c of conns.values()) c.pc.close();
+  // Tell each headset first, so it ends the stream at once instead of treating the silence as a
+  // dropped connection (it showed a connection error, reported 2026-09-30). Close shortly after,
+  // giving "bye" a moment to go out.
+  for (const c of conns.values()) {
+    try { if (c.control?.readyState === "open") c.control.send("bye"); } catch { /* closing anyway */ }
+    const pc = c.pc;
+    setTimeout(() => pc.close(), 300);
+  }
   conns.clear();
   stream?.getTracks().forEach((t) => t.stop());
   stream = null;
@@ -148,7 +157,9 @@ function stopSharing() {
 
 async function connect(code, peer) {
   const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
-  const conn = { pc, name: peer.name, state: "connecting" };
+  // Created before the offer so it's negotiated with it; carries "bye" when sharing stops.
+  const control = pc.createDataChannel("control");
+  const conn = { pc, control, name: peer.name, state: "connecting" };
   conns.set(peer.id, conn);
   render();
 
