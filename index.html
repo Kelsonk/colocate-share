@@ -105,7 +105,9 @@ $("form").addEventListener("submit", async (e) => {
     status("Pick what to share…");
     stream = await navigator.mediaDevices.getDisplayMedia({
       video: { frameRate: { ideal: 30, max: 60 }, width: { max: 1920 }, height: { max: 1080 } },
-      audio: true,
+      // Sharing a browser tab: its sound plays only in the headset, the PC's tab goes quiet (Chrome/Edge;
+      // direct request 2026-11-12). A whole screen's system audio can't be silenced this way.
+      audio: { suppressLocalAudioPlayback: true },
       systemAudio: "include",
     });
   } catch (err) {
